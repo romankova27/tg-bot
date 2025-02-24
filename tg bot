@@ -1,0 +1,545 @@
+import os
+import telebot
+from telebot import types
+import fitz  # PyMuPDF для работы с PDF
+from sentence_transformers import SentenceTransformer, util  # Для анализа текста
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from concurrent.futures import ThreadPoolExecutor
+import fitz
+from functools import lru_cache
+from torch import cosine_similarity
+import openai
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# Инициализация бота с токеном
+bot = telebot.TeleBot('YOUR_BOT')
+
+
+# Словарь для отслеживания состояния пользователей (например, ожидается загрузка PDF)
+user_messages = {}  # Сохраняем ID сообщений для удаления
+user_states = {} # Сохраняем состояние пользователя
+user_headings = {}  # Храним заголовки
+headings_dict = {}
+current_heading = None
+text_accumulator = []
+valid_headings = [
+    "materials and methods", "methods", "experimental", "methodology",
+    "results and discussion", "results", "discussion", "findings"
+]
+
+# Установка пользовательских команд для быстрого доступа
+bot.set_my_commands([
+    telebot.types.BotCommand("start", "Запуск бота"),
+    telebot.types.BotCommand("help", "Помощь"),
+    telebot.types.BotCommand("analyze", "Анализировать статью"),
+    telebot.types.BotCommand("article_headings", "Заголовки статьи")
+])
+
+
+# --- Класс анализа PDF-файлов ---
+class PDFHeadingExtractor:
+    """
+    Класс для извлечения заголовков из PDF-файлов.
+    Использует PyMuPDF для анализа текста и Sentence Transformers для анализа семантического сходства.
+    """
+
+    def __init__(self, model_name='paraphrase-MiniLM-L6-v2'):
+        # Инициализация модели Sentence Transformers
+        self.model = SentenceTransformer(model_name)
+        # Список ключевых слов для анализа заголовков
+        self.keywords = [
+            "Results", "Discussion", "Conclusion", "Acknowledgments", "References",
+            "Summary", "Materials and Methods", "Appendix", "Introduction", "Methods",
+            "Abstract", "Findings", "Results and Discussion", "Conclusions",
+            "Bibliography", "Concluding Remarks", "Future Work", "Further Research", 
+            "Limitations", "Implications", "Final Remarks", "Closing Remarks", "General Discussion",
+            "General Conclusions", "Supplementary Material", "Supporting Information", 
+            "Background"
+        ]
+
+    def extract_with_similarity_analysis(self, page, keywords):
+        """
+        Извлекает заголовки на основе косинусного сходства с ключевыми словами на одной странице.
+        """
+        headings = []
+        text = page.get_text("text")
+        lines = text.split("\n")
+
+        # Преобразуем ключевые слова в эмбеддинги один раз
+        keyword_embeddings = {k: self.model.encode(k, convert_to_tensor=True) for k in keywords}
+
+        for line in lines:
+            line_clean = line.strip().lower()
+            line_embedding = self.model.encode(line_clean, convert_to_tensor=True)
+
+            for _, keyword_embedding in keyword_embeddings.items():
+                similarity = cosine_similarity(line_embedding.unsqueeze(0), keyword_embedding.unsqueeze(0))
+                if similarity.item() > 0.8:  # Порог сходства
+                    headings.append(line.strip())
+                    break
+        return headings
+    
+    def process_page(self, page, keywords):
+        """
+        Обрабатывает страницу PDF для извлечения заголовков.
+        """
+        headings_similarity = self.extract_with_similarity_analysis(page, keywords)
+        print('s', headings_similarity)
+        return headings_similarity 
+    
+    
+    def split_text(text, max_tokens=1500):
+        """Разделение текста на части с учетом ограничений токенов."""
+        words = text.split()
+        chunks = []
+        current_chunk = []
+        current_length = 0
+        
+        for word in words:
+            current_length += len(word) // 4
+            current_chunk.append(word)
+            if current_length >= max_tokens:
+                chunks.append(" ".join(current_chunk))
+                current_chunk = []
+                current_length = 0
+        if current_chunk:
+            chunks.append(" ".join(current_chunk))
+        return chunks
+
+
+    def analyze_text_with_openai(self, headings_text):
+        """Анализ текста и извлечение бактерий и процентов криопротекторов."""
+        results = []
+
+        for heading, text in headings_text:
+            # Формируем запрос для модели
+            prompt = f""" Заголовок: {heading}\nТекст: {text}\n Заголовок: {heading} \n
+            Ты научный анализатор на русском языке. Твоя задача — анализировать текст статьи и извлекать ключевую информацию без сокращений только о тех бактериях и криопротекторах, которые исследуются в данной статье, а не просто упоминаются.  
+            Тебе будет передан фрагмент текста из научной статьи. Извлеки следующую информацию:\n  
+            1. Бактерия:  Название бактерии, которая **использовалась в эксперименте** (например, "Lactobacillus plantarum TISTR 2075").  
+            Если бактерия упоминается как часть чужих исследований, игнорируй её.  \n
+            2. Криопротекторы и их содержание: 
+            - Перечисли только те криопротекторы, которые действительно применялись в эксперименте, и процентное содержание этого вещества.
+            Указывай **только процентное содержание** криопротектора, если оно есть.  
+            Если содержание не указано, пиши "Не указано". 
+            Переводи названия веществ на английский в скобках (например, "Трегалоза (trehalose)").\n 
+            Игнорируй коммерческие названия, производителей и страну происхождения вещества.  
+            Формат ответа должен быть строго таким, не добавляй никакой лишней информации"""
+            try:
+                # Отправляем запрос в OpenAI
+                client = openai.OpenAI(api_key="YOUR_API")  # Создаем клиент OpenAI
+
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[{"role": "user", "content": prompt}]
+)
+                result = response.choices[0].message.content
+                results.append(f"Заголовок: {heading}\n{result}\n")
+            except Exception as e:
+                # В случае ошибки добавляем описание ошибки
+                results.append(f"Ошибка анализа текста для заголовка '{heading}': {str(e)}")
+
+        # Возвращаем все результаты в виде одного текста
+        return "\n".join(results)
+
+
+    def extract_text_from_pdf(pdf_path):
+        """Извлечение текста из PDF."""
+        doc = fitz.open(pdf_path)
+        text = ""
+        for page in doc:
+            text += page.get_text()
+        return text
+
+# --- Команды бота ---
+
+@bot.message_handler(commands=['start'])
+def start(message):
+    """
+    Приветственное сообщение для нового пользователя.
+    """
+    mess = f'''Привет, <b>{message.from_user.first_name}</b>! 👋 
+    
+Если у тебя есть статья в формате PDF, я с удовольствием помогу проанализировать её и извлечь все заголовки. 
+
+Давай начнем!✨'''
+    bot.send_message(message.chat.id, mess, parse_mode='html')
+
+
+@bot.message_handler(commands=['help'])
+def help(message):
+    """
+    Предоставляет информацию о работе с ботом.
+    """
+    mess2 = f'''Если у тебя есть вопросы или нужна помощь по работе с ботом, можешь обратиться к <a>@romankova_a</a>. 
+
+Мы всегда готовы помочь и ответить на твой вопрос! 😊'''
+    bot.send_message(message.chat.id, mess2, parse_mode='html')
+
+
+@bot.message_handler(commands=['article_headings'])
+def article_headings(message):
+    """
+    Устанавливает состояние пользователя для ожидания загрузки PDF-файла.
+    """
+    user_states[message.chat.id] = 'waiting_for_pdf'
+    bot.send_message(message.chat.id, "Отправьте мне PDF-файл для получения заголовков!")
+
+@bot.message_handler(commands=['analyze'])
+def analyze(message):
+    """
+    Устанавливает состояние пользователя для ожидания загрузки PDF-файла.
+    """
+    user_states[message.chat.id] = 'waiting_for_pdf_analyze'
+    bot.send_message(message.chat.id, "Отправьте мне PDF-файл для анализа!")
+    
+    
+    
+# --- Прогрес ---
+def update_progress(progress_message, chat_id, current_page, total_pages):
+    """
+    Обновляет прогресс на основе обработанных страниц.
+    """
+    progress = int((current_page / total_pages) * 100)
+    bot.edit_message_text(f"Анализ документа... {progress}%", chat_id, progress_message.message_id)
+
+def process_pdf_pages(doc, keywords, progress_message, chat_id):
+    """
+    Обрабатывает PDF-файл и обновляет прогресс по мере обработки страниц.
+    """
+    total_pages = len(doc)  # Общее количество страниц
+    current_page = 0  # Текущая страница
+    
+    extractor = PDFHeadingExtractor()
+    all_headings = []
+    for page in doc:
+        headings = extractor.process_page(page, keywords)
+        all_headings.extend(headings)
+        
+        # Увеличиваем счетчик обработанных страниц
+        current_page += 1
+        
+        # Обновляем прогресс
+        update_progress(progress_message, chat_id, current_page, total_pages)
+
+    # Удаление дубликатов и сортировка
+    unique_headings = sorted(set(all_headings), key=all_headings.index)
+    return unique_headings
+
+
+
+@bot.message_handler(content_types=['document'])
+def handle_or_analyze(message):
+    state = user_states.get(message.chat.id)
+    if state == 'waiting_for_pdf':
+        # Вызов обработки заголовков
+        handle_document(message)
+    elif state == 'waiting_for_pdf_analyze':
+        # Вызов анализа статьи
+        handle_bacteria_analysis(message)
+    else:
+        bot.send_message(message.chat.id, "Чтобы загрузить документ, сначала используйте команду /article_headings или /analyze.")
+
+
+def handle_document(message):
+    """
+    Обрабатывает загруженный пользователем PDF-файл.
+    """
+    extractor = PDFHeadingExtractor()
+    if user_states.get(message.chat.id) != 'waiting_for_pdf' and user_states.get(message.chat.id) != 'waiting_for_pdf_analyze':
+        bot.send_message(message.chat.id, "Чтобы загрузить документ, сначала используйте команду /article_headings.")
+        return
+
+    file = message.document
+    if file.mime_type == 'application/pdf':
+        # Отправляем начальное сообщение с прогрессом 0%
+        progress_message = bot.send_message(message.chat.id, "Анализ документа... 0%")
+        # Отправляем стикер, чтобы показать, что начался процесс анализа
+        sticker_id = "CAACAgIAAxkBAAPZZzn0f6i9LFsJ2xydCBmeFYz0N2EAAi1hAAIR9NBJ0dNtPvP7qpM2BA"
+        sent_sticker = bot.send_sticker(message.chat.id, sticker_id)
+        
+        # Загружаем файл
+        try:
+            file_path = f"temp_{file.file_id}.pdf"
+            file_info = bot.get_file(file.file_id)
+            downloaded_file = bot.download_file(file_info.file_path)
+            
+            # Сохраняем файл локально
+            with open(file_path, 'wb') as new_file:
+                new_file.write(downloaded_file)
+            
+            # Открываем PDF
+            doc = fitz.open(file_path)
+            keywords_lower = [k.lower() for k in extractor.keywords]
+            
+            # Анализ страниц с обновлением прогресса
+            headings = process_pdf_pages(doc, keywords_lower, progress_message, message.chat.id)
+                    
+            # Удаляем временный файл после анализа
+            os.remove(file_path)
+            
+            # Формируем ответ для пользователя
+            if headings:
+                # Сохраняем заголовки для пользователя
+                user_headings[message.chat.id] = headings
+
+                # Создаем кнопки для заголовков
+                markup = types.InlineKeyboardMarkup()
+                for idx, heading in enumerate(headings):
+                    button = types.InlineKeyboardButton(text=heading, callback_data=f"heading_{idx}")
+                    markup.add(button)
+                    
+                # Добавляем кнопки "Вся статья" и "Отмена"
+                all_article_button = types.InlineKeyboardButton(text="Вся статья", callback_data="all_article")
+                cancel_button = types.InlineKeyboardButton(text="Отмена", callback_data="cancel")
+                markup.add(all_article_button, cancel_button)
+
+                # Отправляем сообщение и сохраняем его ID
+                sent_message = bot.send_message(message.chat.id, "Выберите раздел:", reply_markup=markup)
+                user_messages[message.chat.id] = {"menu_message_id": sent_message.message_id}
+
+            else:
+                bot.send_message(message.chat.id, "Заголовки не найдены.")
+
+        except Exception as e:
+            bot.send_message(message.chat.id, f"Произошла ошибка при обработке файла: {str(e)}")
+            
+        finally:
+                try:
+                    bot.delete_message(message.chat.id, sent_sticker.message_id)
+                    bot.delete_message(message.chat.id, progress_message.message_id)
+                    # Сбрасываем состояние пользователя
+                    user_states[message.chat.id] = None
+                except Exception as e:
+                    print(f"Не удалось удалить стикер: {e}")
+            
+    else:
+        bot.send_message(message.chat.id, "Пожалуйста, отправьте PDF-файл.")
+
+# --- Обработка кнопок ---
+
+@bot.callback_query_handler(func=lambda call: call.data == 'cancel')
+def handle_cancel(call):
+    """
+    Обрабатывает нажатие кнопки 'Отмена' и удаляет сообщение.
+    """
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+
+    # Удаляем сообщение с результатом анализа, если оно существует
+    if chat_id in user_messages and "result_message" in user_messages[chat_id]:
+        result_message_id = user_messages[chat_id]["result_message"]
+        bot.delete_message(chat_id, result_message_id)
+        del user_messages[chat_id]["result_message"]  # Удаляем запись о сообщении
+
+    # Удаляем сообщение с кнопками
+    bot.delete_message(chat_id, message_id)
+
+    # Сбрасываем состояния и сообщения
+    user_states[chat_id] = None
+    if chat_id in user_messages:
+        bot.delete_message(chat_id, user_messages[chat_id].get("menu_message_id"))
+        del user_messages[chat_id]
+    
+@bot.callback_query_handler(func=lambda call: call.data == 'all_article')
+def handle_all_article(call):
+    """
+    Обрабатывает нажатие кнопки 'Вся статья' и выводит полный текст.
+    """
+    chat_id = call.message.chat.id
+    # Удаляем старое сообщение с меню заголовков
+    menu_message_id = user_messages.get(chat_id, {}).get("menu_message_id")
+    if menu_message_id:
+        try:
+            bot.delete_message(chat_id, menu_message_id)
+        except Exception as e:
+            print(f"Ошибка при удалении старого сообщения с меню: {e}")
+            
+    # Добавляем кнопку "Вернуться назад"
+    back_markup = types.InlineKeyboardMarkup()
+    back_button = types.InlineKeyboardButton("Вернуться назад", callback_data="back_to_menu")
+    back_markup.add(back_button)
+    
+
+    # Здесь можно добавить код для отправки полной статьи
+    sent_message = bot.send_message(chat_id, "Вся статья:", reply_markup=back_markup)
+    
+    # Сохраняем ID этого сообщения для удаления позже
+    user_messages[chat_id]["article_message_id"] = sent_message.message_id
+    
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("heading_"))
+def handle_heading_selection(call):
+    """
+    Обрабатывает выбор заголовка пользователем.
+    """
+    chat_id = call.message.chat.id
+    heading_index = int(call.data.split("_")[1])
+    heading = user_headings.get(chat_id, [])[heading_index]
+
+    # Удаляем старое сообщение с меню заголовков
+    menu_message_id = user_messages.get(chat_id, {}).get("menu_message_id")
+    if menu_message_id:
+        try:
+            bot.delete_message(chat_id, menu_message_id)
+        except Exception as e:
+            print(f"Ошибка при удалении старого сообщения с меню: {e}")
+
+    if heading:
+        # Добавляем кнопку "Вернуться назад"
+        back_markup = types.InlineKeyboardMarkup()
+        back_button = types.InlineKeyboardButton("Вернуться назад", callback_data="back_to_menu")
+        back_markup.add(back_button)
+        
+        # Отправляем сообщение с выбранным заголовком и сохраняем его ID
+        sent_message = bot.send_message(chat_id, f"Вы выбрали раздел: {heading}", reply_markup=back_markup)
+        user_messages[chat_id]["heading_message_id"] = sent_message.message_id
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "back_to_menu")
+def handle_back_to_menu(call):
+    """
+    Обрабатывает нажатие на кнопку "Вернуться назад".
+    """
+    chat_id = call.message.chat.id
+
+    # Удаляем сообщение с выбранным заголовком
+    heading_message_id = user_messages.get(chat_id, {}).get("heading_message_id")
+    try:
+        if heading_message_id is not None:
+            bot.delete_message(chat_id, heading_message_id)
+    except Exception as e:
+            print(f"Не удалось удалить сообщение 1 с ID {heading_message_id}: {e}")
+
+    try:
+        bot.delete_message(chat_id, call.message.message_id)
+    except Exception as e:
+        print(f"Не удалось удалить сообщение 2 с ID {call.message.message_id}: {e}")
+
+    # Восстанавливаем меню заголовков
+    headings = user_headings.get(chat_id, [])
+    if headings:
+        markup = types.InlineKeyboardMarkup()
+        for idx, heading in enumerate(headings):
+            button = types.InlineKeyboardButton(text=heading, callback_data=f"heading_{idx}")
+            markup.add(button)
+            
+        # Добавляем кнопки "Вся статья" и "Отмена"
+        all_article_button = types.InlineKeyboardButton(text="Вся статья", callback_data="all_article")
+        cancel_button = types.InlineKeyboardButton(text="Отмена", callback_data="cancel")
+        markup.add(all_article_button, cancel_button)
+
+        sent_message = bot.send_message(chat_id, "Выберите раздел:", reply_markup=markup)
+        user_messages[chat_id]["menu_message_id"] = sent_message.message_id
+
+
+
+
+def handle_bacteria_analysis(message):
+    """
+    Обрабатывает загруженный PDF-файл, извлекая заголовки и соответствующий текст,
+    затем отправляет результат в виде файла.
+    """
+    extractor = PDFHeadingExtractor()
+    keep_text = False  # Флаг: сохраняем ли текст (True - да, False - нет)
+    file = message.document
+
+
+    if file.mime_type != 'application/pdf':
+        bot.send_message(message.chat.id, "Пожалуйста, загрузите PDF-файл.")
+        return
+
+    progress_message = bot.send_message(message.chat.id, "Анализ документа... 0%")
+    sticker_id = "CAACAgIAAxkBAAPZZzn0f6i9LFsJ2xydCBmeFYz0N2EAAi1hAAIR9NBJ0dNtPvP7qpM2BA"
+    sent_sticker = bot.send_sticker(message.chat.id, sticker_id)
+
+    try:
+        file_path = f"temp_{file.file_id}.pdf"
+        file_info = bot.get_file(file.file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+
+        with open(file_path, 'wb') as new_file:
+            new_file.write(downloaded_file)
+
+        doc = fitz.open(file_path)
+        keywords_lower = [k.lower() for k in extractor.keywords]
+
+        # Анализ страниц с обновлением прогресса
+        headings = process_pdf_pages(doc, keywords_lower, progress_message, message.chat.id)
+
+
+
+        for page in doc:
+            text = page.get_text("text")
+            lines = text.split("\n")
+
+            for line in lines:
+                line_clean = line.strip()
+                if line_clean in headings:
+                    if line_clean.lower() in valid_headings:
+                        if text_accumulator:
+                            headings_dict[current_heading] = " ".join(text_accumulator)
+                        current_heading = line_clean
+                        text_accumulator = []
+                        keep_text = True
+                    else:
+                        current_heading = None
+                        text_accumulator = []
+                        keep_text = False  
+
+                elif keep_text:
+                    text_accumulator.append(line_clean)
+
+
+                    if current_heading and text_accumulator:
+                        headings_dict[current_heading] = " ".join(text_accumulator)
+
+                    
+        os.remove(file_path)
+        bot.delete_message(message.chat.id, progress_message.message_id)
+        bot.delete_message(message.chat.id, sent_sticker.message_id)
+
+        # Создаем кнопки для выбора заголовков
+        markup = InlineKeyboardMarkup(row_width=1)
+        for heading in headings_dict.keys():
+            markup.add(InlineKeyboardButton(heading, callback_data=f"analyze_{heading}"))
+        markup.add(InlineKeyboardButton("Вся статья", callback_data="analyze_all"))
+        markup.add(InlineKeyboardButton("Отмена", callback_data="cancel"))
+
+        bot.send_message(message.chat.id, "Выберите раздел для анализа:", reply_markup=markup)
+
+    except Exception as e:
+        bot.send_message(message.chat.id, f"Ошибка обработки PDF: {str(e)}")
+        
+        
+
+        # Функция обработки нажатий на кнопки заголовков
+@bot.callback_query_handler(func=lambda call: call.data.startswith("analyze_"))
+def process_selected_heading(call):
+    extractor = PDFHeadingExtractor()
+    selected_heading = call.data.replace("analyze_", "")
+
+    if selected_heading == "all":
+        # Отправляем в OpenAI все валидные заголовки
+        headings_text = list(headings_dict.items())
+    else:
+        # Отправляем только выбранный заголовок
+        headings_text = [(selected_heading, headings_dict.get(selected_heading, ""))]
+
+    responses = extractor.analyze_text_with_openai(headings_text)
+
+   # Формируем текст для отправки
+    result_text = f"Результат анализа заголовка: {selected_heading}\n{responses}"
+
+    # Отправляем результат как текстовое сообщение
+    result_message = bot.send_message(call.message.chat.id, result_text)
+    user_messages[call.message.chat.id] = {
+        "result_message": result_message.message_id
+    }
+
+
+    print(responses)
+
+
+# --- Запуск бота ---
+bot.polling(non_stop=True)
